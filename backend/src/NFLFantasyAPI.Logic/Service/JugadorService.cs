@@ -306,6 +306,8 @@ public async Task<ServiceResult> SubirThumbnailAsync(int id, IFormFile thumbnail
                 TotalErrores = 0
             };
 
+            byte[]? fileContent = null;
+
             try
             {
                 // 1. Validar que el archivo no esté vacío
@@ -316,15 +318,21 @@ public async Task<ServiceResult> SubirThumbnailAsync(int id, IFormFile thumbnail
                     {
                         Error = "Archivo vacío o no válido"
                     });
-                    await MoveFileToProcessedFolderAsync(file?.FileName ?? "unknown.json", false);
                     return result;
+                }
+
+                // Guardar el contenido del archivo para luego moverlo
+                using (var memoryStream = new MemoryStream())
+                {
+                    await file.CopyToAsync(memoryStream);
+                    fileContent = memoryStream.ToArray();
                 }
 
                 // 2. Leer y parsear el archivo JSON
                 JugadorBatchRequestDto? batchRequest;
                 try
                 {
-                    using var stream = file.OpenReadStream();
+                    using var stream = new MemoryStream(fileContent);
                     batchRequest = await JsonSerializer.DeserializeAsync<JugadorBatchRequestDto>(stream, new JsonSerializerOptions
                     {
                         PropertyNameCaseInsensitive = true
@@ -337,7 +345,8 @@ public async Task<ServiceResult> SubirThumbnailAsync(int id, IFormFile thumbnail
                     {
                         Error = $"Formato JSON inválido: {ex.Message}"
                     });
-                    await MoveFileToProcessedFolderAsync(file.FileName, false);
+                    var failedPath = await SaveFileToProcessedFolderAsync(file.FileName, fileContent, false);
+                    result.ArchivoMovidoA = failedPath;
                     return result;
                 }
 
@@ -348,7 +357,8 @@ public async Task<ServiceResult> SubirThumbnailAsync(int id, IFormFile thumbnail
                     {
                         Error = "No se encontraron jugadores en el archivo"
                     });
-                    await MoveFileToProcessedFolderAsync(file.FileName, false);
+                    var failedPath = await SaveFileToProcessedFolderAsync(file.FileName, fileContent, false);
+                    result.ArchivoMovidoA = failedPath;
                     return result;
                 }
 
@@ -368,9 +378,9 @@ public async Task<ServiceResult> SubirThumbnailAsync(int id, IFormFile thumbnail
                         Nombre = e.PlayerName,
                         Error = e.ErrorMessage
                     }).ToList();
-                    
-                    await MoveFileToProcessedFolderAsync(file.FileName, false);
-                    result.ArchivoMovidoA = GetProcessedFileName(file.FileName, false);
+
+                    var failedPath = await SaveFileToProcessedFolderAsync(file.FileName, fileContent, false);
+                    result.ArchivoMovidoA = failedPath;
                     return result;
                 }
 
@@ -390,8 +400,8 @@ public async Task<ServiceResult> SubirThumbnailAsync(int id, IFormFile thumbnail
                         NombreEquipoNFL = j.EquipoNFL?.Nombre ?? "N/A"
                     }).ToList();
 
-                    await MoveFileToProcessedFolderAsync(file.FileName, true);
-                    result.ArchivoMovidoA = GetProcessedFileName(file.FileName, true);
+                    var successPath = await SaveFileToProcessedFolderAsync(file.FileName, fileContent, true);
+                    result.ArchivoMovidoA = successPath;
                 }
                 else
                 {
@@ -400,8 +410,8 @@ public async Task<ServiceResult> SubirThumbnailAsync(int id, IFormFile thumbnail
                     {
                         Error = "Error desconocido al crear jugadores"
                     });
-                    await MoveFileToProcessedFolderAsync(file.FileName, false);
-                    result.ArchivoMovidoA = GetProcessedFileName(file.FileName, false);
+                    var failedPath = await SaveFileToProcessedFolderAsync(file.FileName, fileContent, false);
+                    result.ArchivoMovidoA = failedPath;
                 }
 
                 return result;
@@ -414,13 +424,20 @@ public async Task<ServiceResult> SubirThumbnailAsync(int id, IFormFile thumbnail
                 {
                     Error = $"Error del sistema: {ex.Message}"
                 });
-                
-                if (file != null)
+
+                if (file != null && fileContent != null)
                 {
-                    await MoveFileToProcessedFolderAsync(file.FileName, false);
-                    result.ArchivoMovidoA = GetProcessedFileName(file.FileName, false);
+                    try
+                    {
+                        var failedPath = await SaveFileToProcessedFolderAsync(file.FileName, fileContent, false);
+                        result.ArchivoMovidoA = failedPath;
+                    }
+                    catch (Exception moveEx)
+                    {
+                        _logger.LogError(moveEx, "Error al mover archivo después de un fallo en el procesamiento");
+                    }
                 }
-                
+
                 return result;
             }
         }
@@ -428,6 +445,45 @@ public async Task<ServiceResult> SubirThumbnailAsync(int id, IFormFile thumbnail
         private async Task<List<BatchValidationError>> ValidateAllPlayersAsync(List<JugadorBatchItemDto> jugadores)
         {
             var errors = new List<BatchValidationError>();
+
+            // Posiciones válidas de la NFL
+            var posicionesValidas = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "QB", "RB", "WR", "TE", "K", "DEF", "OL", "DL", "LB", "DB", "FB", "P", "LS"
+            };
+
+            // Validar IDs duplicados dentro del batch
+            var idsEnBatch = new Dictionary<int, int>(); // ID -> contador de apariciones
+            foreach (var jugador in jugadores)
+            {
+                if (idsEnBatch.ContainsKey(jugador.Id))
+                {
+                    idsEnBatch[jugador.Id]++;
+                }
+                else
+                {
+                    idsEnBatch[jugador.Id] = 1;
+                }
+            }
+
+            var idsDuplicados = idsEnBatch.Where(kvp => kvp.Value > 1).Select(kvp => kvp.Key).ToList();
+            if (idsDuplicados.Any())
+            {
+                foreach (var id in idsDuplicados)
+                {
+                    var jugadoresConId = jugadores.Where(j => j.Id == id).ToList();
+                    foreach (var jugador in jugadoresConId)
+                    {
+                        errors.Add(new BatchValidationError
+                        {
+                            PlayerId = jugador.Id,
+                            PlayerName = jugador.Nombre,
+                            ErrorMessage = $"El ID {id} aparece {idsEnBatch[id]} veces en el archivo. Cada ID debe ser único",
+                            ErrorType = "duplicate"
+                        });
+                    }
+                }
+            }
 
             // Obtener todos los IDs de equipos NFL en una sola pasada
             var equipoIds = jugadores.Select(j => j.EquipoNFLId).Distinct().ToList();
@@ -448,8 +504,23 @@ public async Task<ServiceResult> SubirThumbnailAsync(int id, IFormFile thumbnail
             }
 
             // Validar cada jugador del batch
-            foreach (var jugador in jugadores)
+            for (int i = 0; i < jugadores.Count; i++)
             {
+                var jugador = jugadores[i];
+
+                // Validar que el ID sea positivo
+                if (jugador.Id <= 0)
+                {
+                    errors.Add(new BatchValidationError
+                    {
+                        PlayerId = jugador.Id,
+                        PlayerName = jugador.Nombre ?? "Sin nombre",
+                        ErrorMessage = $"El ID debe ser un número positivo mayor a 0 (valor actual: {jugador.Id})",
+                        ErrorType = "validation"
+                    });
+                    continue;
+                }
+
                 // Validar campos requeridos
                 if (string.IsNullOrWhiteSpace(jugador.Nombre))
                 {
@@ -475,6 +546,19 @@ public async Task<ServiceResult> SubirThumbnailAsync(int id, IFormFile thumbnail
                     continue;
                 }
 
+                // Validar que la posición sea válida
+                if (!posicionesValidas.Contains(jugador.Posicion.Trim()))
+                {
+                    errors.Add(new BatchValidationError
+                    {
+                        PlayerId = jugador.Id,
+                        PlayerName = jugador.Nombre,
+                        ErrorMessage = $"La posición '{jugador.Posicion}' no es válida. Posiciones válidas: {string.Join(", ", posicionesValidas)}",
+                        ErrorType = "validation"
+                    });
+                    continue;
+                }
+
                 if (jugador.EquipoNFLId <= 0)
                 {
                     errors.Add(new BatchValidationError
@@ -485,6 +569,23 @@ public async Task<ServiceResult> SubirThumbnailAsync(int id, IFormFile thumbnail
                         ErrorType = "validation"
                     });
                     continue;
+                }
+
+                // Validar URL de imagen si está presente
+                if (!string.IsNullOrWhiteSpace(jugador.ImagenUrl))
+                {
+                    if (!Uri.TryCreate(jugador.ImagenUrl, UriKind.Absolute, out var uriResult) ||
+                        (uriResult.Scheme != Uri.UriSchemeHttp && uriResult.Scheme != Uri.UriSchemeHttps))
+                    {
+                        errors.Add(new BatchValidationError
+                        {
+                            PlayerId = jugador.Id,
+                            PlayerName = jugador.Nombre,
+                            ErrorMessage = $"La URL de imagen '{jugador.ImagenUrl}' no tiene un formato válido",
+                            ErrorType = "validation"
+                        });
+                        continue;
+                    }
                 }
 
                 // Validar que el equipo NFL existe
@@ -517,10 +618,11 @@ public async Task<ServiceResult> SubirThumbnailAsync(int id, IFormFile thumbnail
                     continue;
                 }
 
-                // Validar duplicados dentro del mismo batch
+                // Validar duplicados dentro del mismo batch (nombre + equipo)
                 var duplicadoEnBatch = jugadores
-                    .Count(j => string.Equals(j.Nombre.Trim(), jugador.Nombre.Trim(), StringComparison.OrdinalIgnoreCase)
-                                && j.EquipoNFLId == jugador.EquipoNFLId) > 1;
+                    .Where((j, idx) => idx != i) // Excluir el jugador actual
+                    .Any(j => string.Equals(j.Nombre.Trim(), jugador.Nombre.Trim(), StringComparison.OrdinalIgnoreCase)
+                                && j.EquipoNFLId == jugador.EquipoNFLId);
 
                 if (duplicadoEnBatch)
                 {
@@ -595,10 +697,10 @@ public async Task<ServiceResult> SubirThumbnailAsync(int id, IFormFile thumbnail
 
 
         /// <summary>
-        /// Mueve el archivo procesado a la carpeta correspondiente con el formato requerido
-        /// Formato: {Resultado}_{FechaHora}_{NombreOriginal}.json
+        /// Guarda el archivo procesado en la carpeta correspondiente con el formato requerido
+        /// Formato: {timestamp}_{NombreOriginal}.json
         /// </summary>
-        private async Task<string> MoveFileToProcessedFolderAsync(string originalFileName, bool success)
+        private async Task<string> SaveFileToProcessedFolderAsync(string originalFileName, byte[] fileContent, bool success)
         {
             try
             {
@@ -607,39 +709,33 @@ public async Task<ServiceResult> SubirThumbnailAsync(int id, IFormFile thumbnail
                 if (!Directory.Exists(processedFolder))
                 {
                     Directory.CreateDirectory(processedFolder);
+                    _logger.LogInformation($"Creada carpeta de archivos procesados: {processedFolder}");
                 }
 
-                // Generar nombre del archivo procesado
-                var resultado = success ? "Exito" : "Fallo";
+                // Generar nombre del archivo procesado según el formato: <timestamp>_<nombre_original>.json
                 var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
                 var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(originalFileName);
                 var extension = Path.GetExtension(originalFileName);
-                var newFileName = $"{resultado}_{timestamp}_{fileNameWithoutExtension}{extension}";
-                var newFilePath = Path.Combine(processedFolder, newFileName);
 
-                // Nota: En un escenario real, aquí se movería el archivo físico
-                // Como estamos procesando desde un stream, solo generamos el nombre
-                _logger.LogInformation($"Archivo procesado: {newFileName}");
+                // Nombre con timestamp y prefijo de resultado para mejor organización
+                var resultado = success ? "Exito" : "Fallo";
+                var newFileName = $"{timestamp}_{resultado}_{fileNameWithoutExtension}{extension}";
+                var fullPath = Path.Combine(processedFolder, newFileName);
+
+                // Guardar el archivo físicamente en disco
+                await File.WriteAllBytesAsync(fullPath, fileContent);
+
+                _logger.LogInformation($"Archivo guardado exitosamente en: {fullPath}");
 
                 return newFileName;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error al mover archivo a carpeta de procesados");
-                return originalFileName;
+                _logger.LogError(ex, "Error al guardar archivo en carpeta de procesados");
+                // En caso de error, retornar el nombre original con timestamp
+                var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                return $"{timestamp}_Error_{originalFileName}";
             }
-        }
-
-        /// <summary>
-        /// Genera el nombre del archivo procesado
-        /// </summary>
-        private string GetProcessedFileName(string originalFileName, bool success)
-        {
-            var resultado = success ? "Exito" : "Fallo";
-            var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-            var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(originalFileName);
-            var extension = Path.GetExtension(originalFileName);
-            return $"{resultado}_{timestamp}_{fileNameWithoutExtension}{extension}";
         }
 
     }
