@@ -47,6 +47,7 @@ namespace NFLFantasyAPI.Presentation
             builder.Services.AddScoped<IJugadorService, JugadorService>();
             builder.Services.AddScoped<ILigaService, LigaService>();
             builder.Services.AddScoped<ITemporadaService, TemporadaService>();
+            builder.Services.AddScoped<INoticiaJugadorService, NoticiaJugadorService>();
 
             IDbContextProvider contextProvider = new DbContextProvider();
             contextProvider.registerRepositories(builder.Services);
